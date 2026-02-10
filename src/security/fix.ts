@@ -1,4 +1,5 @@
 import JSON5 from "json5";
+import * as fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { OpenClawConfig } from "../config/config.js";
@@ -47,8 +48,10 @@ async function safeChmod(params: {
   require: "dir" | "file";
 }): Promise<SecurityFixChmodAction> {
   try {
-    const st = await fs.lstat(params.path);
-    if (st.isSymbolicLink()) {
+    // First: lstat to reject symlinks and validate expected type.
+    const lst = await fs.lstat(params.path);
+
+    if (lst.isSymbolicLink()) {
       return {
         kind: "chmod",
         path: params.path,
@@ -57,7 +60,7 @@ async function safeChmod(params: {
         skipped: "symlink",
       };
     }
-    if (params.require === "dir" && !st.isDirectory()) {
+    if (params.require === "dir" && !lst.isDirectory()) {
       return {
         kind: "chmod",
         path: params.path,
@@ -66,7 +69,7 @@ async function safeChmod(params: {
         skipped: "not-a-directory",
       };
     }
-    if (params.require === "file" && !st.isFile()) {
+    if (params.require === "file" && !lst.isFile()) {
       return {
         kind: "chmod",
         path: params.path,
@@ -75,7 +78,8 @@ async function safeChmod(params: {
         skipped: "not-a-file",
       };
     }
-    const current = st.mode & 0o777;
+
+    const current = lst.mode & 0o777;
     if (current === params.mode) {
       return {
         kind: "chmod",
@@ -85,10 +89,58 @@ async function safeChmod(params: {
         skipped: "already",
       };
     }
-    await fs.chmod(params.path, params.mode);
-    return { kind: "chmod", path: params.path, mode: params.mode, ok: true };
+
+    // Prefer chmod via an opened FD to reduce TOCTOU risk.
+    // Use O_NOFOLLOW when available; otherwise rely on lstat + inode/dev consistency check.
+    const O_RDONLY = fsSync.constants.O_RDONLY ?? 0;
+    const O_NOFOLLOW = (fsSync.constants as unknown as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+
+    const flags = O_RDONLY | (O_NOFOLLOW ? O_NOFOLLOW : 0);
+
+    const fh = await fs.open(params.path, flags);
+    try {
+      // Best-effort: ensure the FD still points to the same file we lstat'd.
+      // This prevents chmod affecting a different file (including a symlink target) on platforms without O_NOFOLLOW.
+      const st = await fh.stat();
+
+      const lstAny = lst as unknown as { ino?: number; dev?: number };
+      const stAny = st as unknown as { ino?: number; dev?: number };
+
+      if (
+        typeof lstAny.ino === "number" &&
+        typeof lstAny.dev === "number" &&
+        typeof stAny.ino === "number" &&
+        typeof stAny.dev === "number" &&
+        (lstAny.ino !== stAny.ino || lstAny.dev !== stAny.dev)
+      ) {
+        return {
+          kind: "chmod",
+          path: params.path,
+          mode: params.mode,
+          ok: false,
+          skipped: "changed",
+        };
+      }
+
+      await fh.chmod(params.mode);
+      return { kind: "chmod", path: params.path, mode: params.mode, ok: true };
+    } finally {
+      await fh.close().catch(() => null);
+    }
   } catch (err) {
     const code = (err as { code?: string }).code;
+
+    // Many Unix platforms throw ELOOP when opening symlink with O_NOFOLLOW.
+    if (code === "ELOOP") {
+      return {
+        kind: "chmod",
+        path: params.path,
+        mode: params.mode,
+        ok: false,
+        skipped: "symlink",
+      };
+    }
+
     if (code === "ENOENT") {
       return {
         kind: "chmod",
@@ -98,6 +150,7 @@ async function safeChmod(params: {
         skipped: "missing",
       };
     }
+
     return {
       kind: "chmod",
       path: params.path,
